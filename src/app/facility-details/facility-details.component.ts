@@ -25,6 +25,7 @@ import { AccountVerificationComponent } from '../shared/components/account-verif
 import { HoldRetryNoticeComponent } from '../shared/components/hold-retry-notice/hold-retry-notice.component';
 import { pageTitle } from '../page-title.strategy';
 import { BookingUtils } from '../utils/booking-utils';
+import { AvailabilitySelection, AvailabilityState, evaluateAvailability, PassOption } from './availability-state';
 
 @Component({
   selector: 'app-facility-details',
@@ -41,14 +42,14 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   public form: UntypedFormGroup;
   public facilityOpen = true;
   public isLoggedIn = false;
-  public passesAvailable = false;
-  public passStatus: 'closed' | 'available' | 'not-required' | 'sold-out' | 'not-open-yet' = 'available';
-  // In park time, so a visitor in another zone is told 7:00 AM Pacific, not their local hour.
-  public reservationOpensAt: DateTime | null = null;
+  public availabilityState: AvailabilityState = { status: 'idle' };
   private windowTimer: any = null;
+  private availabilityRequest = 0;
+  private productDatesRequest = 0;
+  private activityRequest = 0;
+  private readonly noPassOptions: PassOption[] = [];
   public loadingProducts = false;
   public loadingDates = false;
-  public loadingPasses = false;
   
   public facility;
   public geozone;
@@ -73,7 +74,16 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   public startDate = DateTime.now().startOf('day');
   public endDate = this.startDate.plus({ days: 2 });
 
-  public availableVisitorsAllowed: any[] = [];
+  get passStatus() { return this.availabilityState.status; }
+  get passesAvailable() { return this.availabilityState.status === 'available'; }
+  get loadingPasses() { return this.availabilityState.status === 'loading'; }
+  get availableVisitorsAllowed() {
+    return this.availabilityState.status === 'available' ? this.availabilityState.options : this.noPassOptions;
+  }
+  // In park time, so a visitor in another zone is told 7:00 AM Pacific, not their local hour.
+  get reservationOpensAt(): DateTime | null {
+    return this.availabilityState.status === 'not-open-yet' ? this.availabilityState.opensAt : null;
+  }
 
   private selectedCollectionId: string;
   private selectedActivityType: string;
@@ -233,6 +243,14 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   async setFormProduct(activity) {
     // When the user chooses/changes the activity, we need to retrieve the products related
     if (!activity) return;
+    const request = ++this.activityRequest;
+    ++this.productDatesRequest;
+    this.invalidateAvailability();
+    this.loadingDates = false;
+    this.datesLoadFailed = false;
+    this.availableDates = {};
+    this.form.get('selectedProduct').setValue(null, { emitEvent: false });
+    this.form.get('selectedDate').setValue(null, { emitEvent: false });
     
     const pk = activity.split('#')[0];
     const sk = activity.split('#')[1];
@@ -253,6 +271,7 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
 
     // The related product pk/sk is made up from the selected activity's pk/sk
     const relatedProducts = (await this.productService.getProductsByActivity(collectionId, activityType, activityId))?.items || [];
+    if (this.destroyRef.destroyed || request !== this.activityRequest) return;
     this.loadingProducts = false;
 
     // Populate the "Pass type" dropdown with each product
@@ -268,13 +287,24 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
 
   setFormProductDates() {
     this.form.get('selectedProduct').valueChanges.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((product) => {
-      if (!product) return;
+      if (!product) {
+        ++this.productDatesRequest;
+        this.loadingDates = false;
+        this.datesLoadFailed = false;
+        this.availableDates = {};
+        this.passValidity = null;
+        this.form.get('selectedDate').setValue(null, { emitEvent: false });
+        this.invalidateAvailability();
+        return;
+      }
       this.selectedProductName = this.availableProducts.find(p => p.value === product)?.display || '';
       this.loadProductDates(product);
     });
   }
 
   private async loadProductDates(product: string) {
+    const request = ++this.productDatesRequest;
+    this.invalidateAvailability();
     const pk = product.split('#')[0];
     const selectedProductId = product.split('#')[1];
     const collectionId = pk.split('::')[1];
@@ -283,8 +313,9 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
     const productId = selectedProductId || null;
 
     this.loadingDates = true;
+    this.datesLoadFailed = false;
+    this.availableDates = {};
     this.passValidity = null;
-    this.passStatus = 'available'; // Reset these when product changges and clear the other fields. 
     this.form.get('selectedDate').setValue(null, { emitEvent: false });
     this.form.get('selectedVisitors').setValue(null, { emitEvent: false });
 
@@ -298,13 +329,13 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
       DateTime.now().toISODate(),
       DateTime.now().plus({ days: 2 }).toISODate()
     );
+    if (this.destroyRef.destroyed || request !== this.productDatesRequest || this.form.get('selectedProduct').value !== product) return;
     this.loadingDates = false;
 
     // The service returns null only when the request itself failed. Bail out here rather
     // than falling through to the empty-array path, which would report a sold-out facility.
     if (productDatesResult === null) {
       this.datesLoadFailed = true;
-      this.passesAvailable = false;
       this.availableDates = {};
       return;
     }
@@ -312,10 +343,6 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
 
     // API returns a plain array of ProductDates; fall back to `.items` for any legacy wrapped shape
     const dates = Array.isArray(productDatesResult) ? productDatesResult : (productDatesResult?.items || []);
-
-    if (dates.length === 0) {
-      this.passesAvailable = false;
-    }
 
     // Convert this.availableDates to an object with sk: {availableDate}
     const availableDatesMap = {}
@@ -337,138 +364,115 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
 
   setFormPassesAvailable() {
     this.form.get('selectedDate').valueChanges.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((date) => {
-      if (!date) return;
+      if (!date) {
+        this.invalidateAvailability();
+        return;
+      }
       this.loadPassesAvailable(date);
     });
   }
 
-  private async loadPassesAvailable(date: any) {
-      clearTimeout(this.windowTimer);
-      this.loadingPasses = true;
-      this.passesAvailable = false;
-      this.passStatus = 'available';
-      this.availableVisitorsAllowed = [];
-      this.selectedDateStr = typeof date === 'string' ? date : (date?.['toISODate'] ? date['toISODate']() : String(date));
-      this.waitingRoomActive = false;
-      this.updatePassValidity(this.selectedDateStr);
-
-      // Check Mode 1 waiting room status for the selected date
-      if (this.selectedCollectionId && this.selectedActivityType && this.selectedActivityId) {
-        try {
-          const res = await lastValueFrom(this.apiService.get(
-            `activities/${this.selectedCollectionId}`,
-            { activityType: this.selectedActivityType, activityId: this.selectedActivityId, startDate: this.selectedDateStr }
-          ));
-          this.waitingRoomActive = res?.['data']?.waitingRoomActive === true;
-        } catch {
-          // Fail open — booking API enforces server-side
-        }
-      }
-
-      const selectedDate = this.availableDates[date];
-      const resContext = selectedDate?.reservationContext;
-      let inventoryPool = selectedDate?.inventoryPool;
-      
-      // When we select a date, get the inventory data for banners.
-      if (!inventoryPool) {
-        const productId = this.getProductIdFromForm();
-        inventoryPool = await this.inventoryPoolService.getInventoryPool(
-          this.selectedCollectionId,
-          this.selectedActivityType,
-          this.selectedActivityId,
-          productId,
-          this.selectedDateStr
-        );
-      }
-      //const isReservable = resContext?.isReservable; will be used in future state to determine reservability from policies
-      const minInv = resContext?.minDailyInventory;
-      const maxInv = resContext?.maxDailyInventory;
-      const reservationWindow = resContext?.temporalWindows?.reservationWindow;
-      const reservationWindowOpen = this.parseDateTimeValue(reservationWindow?.open);
-      const reservationWindowClose = this.parseDateTimeValue(reservationWindow?.close);
-      const currentDateTime = this.serverTime.now();
-
-      // inventoryPool.isOpen indicates if passes are required. Display the banner
-       if (inventoryPool && inventoryPool?.closureStatus === true) {
-        this.passStatus = 'closed';
-        this.passesAvailable = false;
-        this.loadingPasses = false;
-        this.cdr.detectChanges();
-        return;
-      }
-
-
-      if ((inventoryPool && inventoryPool.isOpen === false) || inventoryPool?.available === null) {
-        this.passStatus = 'not-required';
-        this.passesAvailable = false;
-        this.availableVisitorsAllowed = [{display: 'Unavailable', value: '0' }];
-        this.loadingPasses = false;
-        this.cdr.detectChanges();
-        return;
-      }
-
-      // Check availability from inventory pool.
-      // Only show sold-out if we have actual inventory data indicating 0 or less
-      if (inventoryPool && inventoryPool.available !== null && inventoryPool.available !== undefined && inventoryPool.available <= 0) {
-        this.passStatus = 'sold-out';
-        this.passesAvailable = false;
-        this.availableVisitorsAllowed = [{display: 'Unavailable', value: '0' }];
-        this.loadingPasses = false;
-        this.cdr.detectChanges();
-        return;
-      }
-
-      // Server time, not the device clock, so a fast clock can't offer a booking the API refuses.
-      if (reservationWindowOpen?.isValid && reservationWindowClose?.isValid && currentDateTime >= reservationWindowOpen && currentDateTime <= reservationWindowClose) {
-        this.passesAvailable = true;
-        this.reservationOpensAt = null;
-      } else {
-        this.passesAvailable = false;
-        if (reservationWindowOpen?.isValid && currentDateTime < reservationWindowOpen) {
-          this.passStatus = 'not-open-yet';
-          this.reservationOpensAt = reservationWindowOpen.setZone(Constants.timeZoneIANA);
-          this.scheduleWindowRecheck(reservationWindowOpen);
-        }
-      }
-
-      // Provide the number of passes allowed using minimum count up to maximum.
-      // Vehicle parking day-use passes are one pass per booking (one vehicle),
-      // so cap the selectable count at 1 regardless of maxDailyInventory (#566).
-      const isParking = this.selectedActivitySubType === 'vehicleParking';
-      const effectiveMin = isParking ? 1 : minInv;
-      const effectiveMax = isParking ? 1 : Math.min(maxInv, inventoryPool?.available || maxInv);
-      const allowedVisitors = [];
-      for (let i = effectiveMin; i <= effectiveMax; i++) {
-        allowedVisitors.push({
-          display: i.toString(),
-          value: i.toString()
-        });
-      }
-      this.availableVisitorsAllowed = allowedVisitors;
-      
-      // Auto-select 1 pass for vehicle parking
-      if (isParking && this.availableVisitorsAllowed.length > 0) {
-        this.form.get('selectedVisitors').setValue('1', { emitEvent: false });
-      }
-      
-      this.loadingPasses = false;
-      this.cdr.detectChanges();
+  private invalidateAvailability(): void {
+    ++this.availabilityRequest;
+    clearTimeout(this.windowTimer);
+    this.availabilityState = { status: 'idle' };
+    this.selectedDateStr = '';
+    this.waitingRoomActive = false;
+    this.form.get('selectedVisitors').setValue(null, { emitEvent: false });
   }
 
-  private parseDateTimeValue(value: unknown): DateTime {
-    if (typeof value === 'number') {
-      return DateTime.fromMillis(value);
-    }
+  private dateString(date: any): string {
+    return typeof date === 'string' ? date : (date?.toISODate ? date.toISODate() : String(date));
+  }
 
-    if (typeof value === 'string') {
-      if (/^\d+$/.test(value)) {
-        return DateTime.fromMillis(Number(value));
+  private isCurrentAvailability(request: number, selection: AvailabilitySelection): boolean {
+    return !this.destroyRef.destroyed && request === this.availabilityRequest &&
+      selection.collectionId === (this.selectedCollectionId || '') &&
+      selection.activityType === (this.selectedActivityType || '') &&
+      selection.activityId === (this.selectedActivityId || '') &&
+      selection.productId === this.getProductIdFromForm() &&
+      selection.date === this.dateString(this.form.get('selectedDate').value);
+  }
+
+  public async retryAvailability(): Promise<void> {
+    if (!this.isLoggedIn || !this.emailVerificationLoaded || !this.emailVerified || this.loadingPasses || this.loadingDates || this.loadingProducts) return;
+    if (!this.datesLoadFailed && this.passStatus !== 'error') return;
+    const product = this.form.get('selectedProduct').value;
+    const date = this.form.get('selectedDate').value;
+    if (!product) return;
+    // Recheck both policy/context and inventory; either may have caused the error.
+    const reload = this.loadProductDates(product);
+    const datesRequest = this.productDatesRequest;
+    const availabilityRequest = this.availabilityRequest;
+    await reload;
+    if (this.destroyRef.destroyed || datesRequest !== this.productDatesRequest ||
+        availabilityRequest !== this.availabilityRequest || this.form.get('selectedProduct').value !== product || this.datesLoadFailed) return;
+    if (date && this.availableDates[this.dateString(date)]) {
+      this.form.get('selectedDate').setValue(date, { emitEvent: false });
+      await this.loadPassesAvailable(date, true);
+    }
+  }
+
+  private async loadPassesAvailable(date: any, refresh = false): Promise<void> {
+    const request = ++this.availabilityRequest;
+    clearTimeout(this.windowTimer);
+    // Capture every input before awaiting: no response may change a newer selection.
+    const selection: AvailabilitySelection = {
+      collectionId: this.selectedCollectionId || '',
+      activityType: this.selectedActivityType || '',
+      activityId: this.selectedActivityId || '',
+      productId: this.getProductIdFromForm(),
+      date: this.dateString(date)
+    };
+    const selectedDate = this.availableDates[selection.date];
+    const context = selectedDate?.reservationContext;
+    const cachedInventory = selectedDate?.inventoryPool;
+    const isParking = this.selectedActivitySubType === 'vehicleParking';
+    this.selectedDateStr = selection.date;
+    this.waitingRoomActive = false;
+    this.availabilityState = { status: 'loading', selection };
+    this.form.get('selectedVisitors').setValue(null, { emitEvent: false });
+    this.updatePassValidity(selection.date);
+
+    let waitingRoomActive = false;
+    if (selection.collectionId && selection.activityType && selection.activityId) {
+      try {
+        const res = await lastValueFrom(this.apiService.get(
+          `activities/${selection.collectionId}`,
+          { activityType: selection.activityType, activityId: selection.activityId, startDate: selection.date }
+        ));
+        waitingRoomActive = res?.['data']?.waitingRoomActive === true;
+      } catch {
+        // Booking API continues to enforce waiting-room admission server-side.
       }
-
-      return DateTime.fromISO(value);
+      if (!this.isCurrentAvailability(request, selection)) return;
     }
 
-    return DateTime.invalid('Invalid temporal window value');
+    let inventory = cachedInventory;
+    if (refresh || !cachedInventory) {
+      try {
+        inventory = await this.inventoryPoolService.getInventoryPool(
+          selection.collectionId, selection.activityType, selection.activityId, selection.productId, selection.date
+        );
+      } catch {
+        inventory = null;
+      }
+    }
+    if (!this.isCurrentAvailability(request, selection)) return;
+
+    if (refresh && cachedInventory) {
+      // Do not revive an invalid embedded snapshot when the visitor returns to this date.
+      this.availableDates[selection.date] = { ...selectedDate, inventoryPool: undefined };
+    }
+    this.waitingRoomActive = waitingRoomActive;
+    this.availabilityState = evaluateAvailability(selection, inventory, context, this.serverTime.now(), isParking);
+    if (this.passesAvailable && isParking) {
+      this.form.get('selectedVisitors').setValue('1', { emitEvent: false });
+    }
+    if (this.availabilityState.status === 'not-open-yet') {
+      this.scheduleWindowRecheck(this.availabilityState.opensAt, request, selection);
+    }
+    this.cdr.detectChanges();
   }
 
   public onCalendarDisplayChange() {
@@ -522,6 +526,9 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   }
 
   async submit(): Promise<void> {
+    if (!this.passesAvailable || !this.isLoggedIn || !this.emailVerificationLoaded || !this.emailVerified || this.loadingDates || this.loadingProducts) return;
+    const quantity = String(this.form.get('selectedVisitors').value);
+    if (!this.availableVisitorsAllowed.some(option => option.value === quantity)) return;
     if (this.holdRetryAt) return;
 
     // Gate the booking action when Mode 2 is active and user lacks admission
@@ -765,19 +772,22 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   }
 
   // Short steps rather than one long timeout: timers pause while a device sleeps.
-  private scheduleWindowRecheck(opensAt: DateTime): void {
+  private scheduleWindowRecheck(opensAt: DateTime, request: number, selection: AvailabilitySelection): void {
     clearTimeout(this.windowTimer);
+    if (!this.isCurrentAvailability(request, selection)) return;
     const msUntilOpen = opensAt.toMillis() - this.serverTime.now().toMillis();
     if (msUntilOpen <= 0) {
-      this.loadPassesAvailable(this.form.get('selectedDate').value).then(() => this.cdr.detectChanges());
+      this.loadPassesAvailable(selection.date);
       return;
     }
-    this.windowTimer = setTimeout(() => this.scheduleWindowRecheck(opensAt), Math.min(msUntilOpen + 250, 60_000));
+    this.windowTimer = setTimeout(() => this.scheduleWindowRecheck(opensAt, request, selection), Math.min(msUntilOpen + 250, 60_000));
   }
 
   ngOnDestroy(): void {
+    ++this.activityRequest;
+    ++this.productDatesRequest;
+    ++this.availabilityRequest;
     this.scrollEvents.forEach(e => window.removeEventListener(e, this.onScroll));
     clearTimeout(this.windowTimer);
-    this.cdr.detectChanges()
   }
 }

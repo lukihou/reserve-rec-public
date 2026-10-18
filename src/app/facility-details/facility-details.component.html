@@ -243,7 +243,7 @@
                   [control]="this.form.get('selectedVisitors')"
                   [selectionListItems]="availableVisitorsAllowed"
                   [label]="'Number of passes'"
-                  [placeholder]="loadingPasses ? 'Loading...' : (passesAvailable ? 'Select number of passes' : (datesLoadFailed ? 'Unable to load' : 'Unavailable'))"
+                  [placeholder]="loadingPasses ? 'Loading...' : (passesAvailable ? 'Select number of passes' : (datesLoadFailed || passStatus === 'error' ? 'Unable to load' : 'Unavailable'))"
                   [disabled]="!this.form.get('selectedProduct').value ||
                     this.availableProducts.length === 0 ||
                     loadingPasses ||
@@ -316,18 +316,29 @@
                 </div>
               } @else if (emailVerificationLoaded && !emailVerified) {
                 <app-account-verification (emailVerified)="onEmailVerified()" />
+              } @else if (!emailVerificationLoaded) {
+                <p class="text-white mb-0" role="status">Checking your account…</p>
+              } @else if (loadingProducts || loadingDates || loadingPasses) {
+                <p class="text-white mb-0" role="status">Checking availability…</p>
+              } @else if (passStatus === 'error' || datesLoadFailed) {
+                <div class="alert alert-danger p-3 mb-0" role="alert">
+                  <strong>Availability unavailable — try again</strong>
+                  <button type="button" class="btn btn-outline-dark mt-2 d-block" (click)="retryAvailability()">Try again</button>
+                </div>
+              } @else if (passStatus === 'expired') {
+                <div class="alert alert-info p-3 mb-0" role="status">Bookings for this date are closed.</div>
               } @else if (passStatus === 'available' && isLoggedIn) {
                 <app-hold-retry-notice [retryAt]="holdRetryAt" (elapsed)="onHoldRetryElapsed()" />
                 <button
                   class="disable-btn btn bg-white text-primary fw-bold rounded-1 px-4 w-100"
-                  [disabled]="(!this.form.get('selectedVisitors').value && selectedActivitySubType !== 'vehicleParking') || !this.form.get('selectedDate').value || !this.form.get('selectedProduct').value || !this.passesAvailable"
+                  [disabled]="(!this.form.get('selectedVisitors').value && selectedActivitySubType !== 'vehicleParking') || !this.form.get('selectedDate').value || !this.form.get('selectedProduct').value || !this.passesAvailable || !emailVerified"
                   [attr.aria-disabled]="holdRetryAt ? 'true' : null"
                   [attr.aria-describedby]="holdRetryAt ? 'hold-retry-notice' : null"
                   (click)="submit()"
                   >
-                  {{ passesAvailable ? "Book day-use pass" : (datesLoadFailed ? "Availability unavailable — try again" : "No passes available") }}
+                  Book day-use pass
                 </button>
-              } @else { <!-- Status is passes not required.... or unknown  -->
+              } @else if (passStatus === 'not-required') {
                 <div class="alert alert-info p-3 d-flex align-items-start" role="status">
                   <div class="me-3" style="margin-top: 2px;">
                     <i class="fa-regular fa-circle-info text-primary fs-5"></i>
@@ -336,6 +347,8 @@
                     <strong class="text-dark">Day use passes not required for this day.</strong>
                   </div>
                 </div>
+              } @else {
+                <p class="text-white mb-0" role="status">Select a pass type and date to check availability.</p>
               }
             </div>
           </div>
