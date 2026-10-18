@@ -243,7 +243,7 @@
                   [control]="this.form.get('selectedVisitors')"
                   [selectionListItems]="availableVisitorsAllowed"
                   [label]="'Number of passes'"
-                  [placeholder]="loadingPasses ? 'Loading...' : (passesAvailable ? 'Select number of passes' : (datesLoadFailed ? 'Unable to load' : 'Unavailable'))"
+                  [placeholder]="loadingPasses ? 'Loading...' : (passesAvailable ? 'Select number of passes' : (datesLoadFailed || passStatus === 'error' ? 'Unable to load' : 'Unavailable'))"
                   [disabled]="!this.form.get('selectedProduct').value ||
                     this.availableProducts.length === 0 ||
                     loadingPasses ||
@@ -283,6 +283,15 @@
                     <strong class="text-dark">This park area is closed for the selected date and time.</strong>
                   </div>
                 </div> -->
+              } @else if (passStatus === 'error') {
+                <div class="alert alert-danger p-3 d-flex align-items-start" role="alert">
+                  <div class="me-3">
+                    <i class="fa-regular fa-circle-exclamation text-danger fs-5"></i>
+                  </div>
+                  <div>
+                    <strong class="text-dark">Availability unavailable — try again</strong>
+                  </div>
+                </div>
               } @else if (passStatus === 'closed') {
                 <div class="alert alert-danger p-3 d-flex align-items-start" role="status">
                   <div class="me-3">
@@ -327,7 +336,7 @@
                   >
                   {{ passesAvailable ? "Book day-use pass" : (datesLoadFailed ? "Availability unavailable — try again" : "No passes available") }}
                 </button>
-              } @else { <!-- Status is passes not required.... or unknown  -->
+              } @else if (passStatus === 'not-required') {
                 <div class="alert alert-info p-3 d-flex align-items-start" role="status">
                   <div class="me-3" style="margin-top: 2px;">
                     <i class="fa-regular fa-circle-info text-primary fs-5"></i>

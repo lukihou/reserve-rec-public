@@ -42,7 +42,7 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
   public facilityOpen = true;
   public isLoggedIn = false;
   public passesAvailable = false;
-  public passStatus: 'closed' | 'available' | 'not-required' | 'sold-out' | 'not-open-yet' = 'available';
+  public passStatus: 'closed' | 'available' | 'not-required' | 'sold-out' | 'not-open-yet' | 'error' = 'available';
   // In park time, so a visitor in another zone is told 7:00 AM Pacific, not their local hour.
   public reservationOpensAt: DateTime | null = null;
   private windowTimer: any = null;
@@ -398,7 +398,7 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
       }
 
 
-      if ((inventoryPool && inventoryPool.isOpen === false) || inventoryPool?.available === null) {
+      if (inventoryPool?.isOpen === false) {
         this.passStatus = 'not-required';
         this.passesAvailable = false;
         this.availableVisitorsAllowed = [{display: 'Unavailable', value: '0' }];
@@ -407,9 +407,19 @@ export class FacilityDetailsComponent implements OnInit, AfterViewInit, OnDestro
         return;
       }
 
+      // A failed lookup or unknown count is not evidence that no pass is required.
+      if (inventoryPool?.isOpen !== true || !Number.isFinite(inventoryPool?.available)) {
+        this.passStatus = 'error';
+        this.reservationOpensAt = null;
+        this.form.get('selectedVisitors').setValue(null, { emitEvent: false });
+        this.loadingPasses = false;
+        this.cdr.detectChanges();
+        return;
+      }
+
       // Check availability from inventory pool.
       // Only show sold-out if we have actual inventory data indicating 0 or less
-      if (inventoryPool && inventoryPool.available !== null && inventoryPool.available !== undefined && inventoryPool.available <= 0) {
+      if (inventoryPool.available <= 0) {
         this.passStatus = 'sold-out';
         this.passesAvailable = false;
         this.availableVisitorsAllowed = [{display: 'Unavailable', value: '0' }];

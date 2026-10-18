@@ -24,10 +24,13 @@ import { ServerTimeService } from '../services/server-time.service';
 import { Router } from '@angular/router';
 import { of } from 'rxjs';
 import { DateTime } from 'luxon';
+import * as bootstrap from 'bootstrap';
 import { BookingService } from '../services/booking.service';
 import { CartItem, CartService } from '../services/cart.service';
 import { ToastService } from '../services/toast.service';
 import { ProductDateService } from '../services/product-date.service';
+import { InventoryPoolService } from '../services/inventory-pool.service';
+import { ApiService } from '../services/api.service';
 
 describe('FacilityDetailsComponent', () => {
   let component: FacilityDetailsComponent;
@@ -184,6 +187,147 @@ describe('FacilityDetailsComponent', () => {
       .toContain('could not load this day-use area');
     // The booking form must not be offered for a facility that never loaded.
     expect(el.querySelector('form')).toBeNull();
+  });
+
+  describe('inventory availability', () => {
+    const date = DateTime.now().toISODate();
+    let getInventoryPool: jasmine.Spy;
+    let bootstrapDescriptor: PropertyDescriptor | undefined;
+    const el = (): HTMLElement => fixture.nativeElement;
+    const bookButton = () => Array.from(el().querySelectorAll('button')).find(b => b.textContent?.includes('Book day-use pass'));
+
+    // Populated ngds dropdowns use the Bootstrap global supplied by the application scripts.
+    beforeAll(() => {
+      bootstrapDescriptor = Object.getOwnPropertyDescriptor(window, 'bootstrap');
+      Object.defineProperty(window, 'bootstrap', { configurable: true, writable: true, value: bootstrap });
+    });
+
+    afterAll(() => {
+      if (bootstrapDescriptor) Object.defineProperty(window, 'bootstrap', bootstrapDescriptor);
+      else delete (window as any).bootstrap;
+    });
+
+    beforeEach(async () => {
+      component.isLoggedIn = true;
+      component.emailVerificationLoaded = true;
+      component.emailVerified = true;
+      component.availableProducts = [{ display: 'Trail pass', value: 'product::c1::dayuse::a1#p1' }];
+      component.form.get('selectedProduct').setValue('product::c1::dayuse::a1#p1', { emitEvent: false });
+      component.form.get('selectedDate').setValue(date, { emitEvent: false });
+      component.form.get('selectedVisitors').setValue('2', { emitEvent: false });
+      component.availableDates = {
+        [date]: {
+          reservationContext: {
+            minDailyInventory: 1,
+            maxDailyInventory: 4,
+            temporalWindows: { reservationWindow: { open: Date.now() - 1000, close: Date.now() + 86400000 } }
+          }
+        }
+      };
+      Object.assign(component as any, { selectedCollectionId: 'c1', selectedActivityType: 'dayuse', selectedActivityId: 'a1' });
+      spyOn(TestBed.inject(ApiService), 'get').and.returnValue(of({ data: { waitingRoomActive: false } }));
+      spyOn(component as any, 'loadProductDates').and.resolveTo();
+      getInventoryPool = spyOn(TestBed.inject(InventoryPoolService), 'getInventoryPool').and.resolveTo(null);
+      fixture.detectChanges();
+      await fixture.whenStable();
+      getInventoryPool.calls.reset();
+      component.form.get('selectedVisitors').setValue('2', { emitEvent: false });
+    });
+
+    afterEach(() => fixture.destroy());
+
+    async function loadInventory(pool: any, cached = false) {
+      if (cached) {
+        component.availableDates[date].inventoryPool = pool;
+      } else {
+        getInventoryPool.and.resolveTo(pool);
+      }
+      await (component as any).loadPassesAvailable(date);
+      fixture.detectChanges();
+    }
+
+    function expectUnavailable() {
+      expect(el().querySelector('#request-a-pass [role="alert"]')?.textContent)
+        .toContain('Availability unavailable — try again');
+      expect(el().textContent).not.toContain('Day use passes not required for this day.');
+      expect(component.passesAvailable).toBeFalse();
+      expect(component.loadingPasses).toBeFalse();
+      expect(component.availableVisitorsAllowed).toEqual([]);
+      expect(component.form.get('selectedVisitors').value).toBeNull();
+      expect(bookButton()).toBeUndefined();
+    }
+
+    it('renders an error and offers no booking after a failed inventory lookup', async () => {
+      await loadInventory(null);
+
+      expectUnavailable();
+      expect(getInventoryPool).toHaveBeenCalledOnceWith('c1', 'dayuse', 'a1', 'p1', date);
+    });
+
+    for (const [label, pool] of [
+      ['null availability', { isOpen: true, available: null }],
+      ['missing availability', { isOpen: true }],
+      ['a non-numeric count', { isOpen: true, available: '3' }],
+      ['a non-finite count', { isOpen: true, available: NaN }],
+      ['a missing pass requirement', { available: 3 }]
+    ] as const) {
+      it(`does not offer booking or report no pass required for ${label}`, async () => {
+        await loadInventory(pool);
+
+        expectUnavailable();
+      });
+    }
+
+    it('also renders an error for unknown inventory cached on a product date', async () => {
+      await loadInventory({ isOpen: true, available: null }, true);
+
+      expectUnavailable();
+      expect(getInventoryPool).not.toHaveBeenCalled();
+    });
+
+    it('shows no pass required only for an explicit isOpen false response', async () => {
+      await loadInventory({ isOpen: false, available: null });
+
+      expect(el().textContent).toContain('Day use passes not required for this day.');
+      expect(el().querySelector('#request-a-pass [role="alert"]')).toBeNull();
+      expect(component.passesAvailable).toBeFalse();
+      expect(bookButton()).toBeUndefined();
+    });
+
+    it('preserves the closure banner even when no pass is required', async () => {
+      await loadInventory({ isOpen: false, available: null, closureStatus: true });
+
+      expect(el().textContent).toContain('This park area is closed for the selected date and time.');
+      expect(el().textContent).not.toContain('Day use passes not required for this day.');
+      expect(component.passesAvailable).toBeFalse();
+    });
+
+    it('preserves the sold-out state for a verified zero count', async () => {
+      await loadInventory({ isOpen: true, available: 0 });
+
+      expect(el().textContent).toContain('Day-use passes for this day have been fully reserved.');
+      expect(component.passesAvailable).toBeFalse();
+      expect(bookButton()).toBeUndefined();
+    });
+
+    it('clears the error when a later inventory lookup succeeds', async () => {
+      await loadInventory(null);
+      await loadInventory({ isOpen: true, available: 3 });
+      component.form.get('selectedVisitors').setValue('2', { emitEvent: false });
+      fixture.detectChanges();
+
+      expect(el().querySelector('#request-a-pass [role="alert"]')).toBeNull();
+      expect(component.passesAvailable).toBeTrue();
+      expect(component.availableVisitorsAllowed.map(v => v.value)).toEqual(['1', '2', '3']);
+      expect(bookButton()?.disabled).toBeFalse();
+    });
+
+    it('does not auto-select a vehicle pass when inventory is unknown', async () => {
+      component.selectedActivitySubType = 'vehicleParking';
+      await loadInventory(null);
+
+      expectUnavailable();
+    });
   });
 
   describe('reservation window', () => {
